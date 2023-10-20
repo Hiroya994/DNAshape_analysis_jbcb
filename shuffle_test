@@ -1,0 +1,146 @@
+## shuffle test
+
+## selected_parameter: All parameters which was selected in the model except for the parameters you want to shuffle. Should be written as the list format.
+## test_parameter: The parameters you want to shuffle
+
+## This code is conducted in R
+
+svm_ROC_curve_loo_shuffle_test <- function(file_name, selected_parameter, test_parameter) {
+	
+	##### library import #####
+	
+	library(tidyverse)
+	library(e1071)
+	library(pROC)
+	
+	##### import data #####
+	
+	all <- read.csv(file_name, header = T)
+	
+	positive_all  <- all %>% dplyr::filter(Bind_type == "T_multi")
+	negative_all  <- all %>% dplyr::filter(Bind_type == "FP")
+	
+	## data making
+	
+	n_data  <- nrow(positive_all) 	  # number of data
+	
+	positive  <- positive_all[order(positive_all$ED, decreasing = T),] %>% dplyr::slice(1:n_data)
+	negative  <- negative_all[order(negative_all$ED),] %>% dplyr::slice(1:n_data)
+	
+	##### preparing and deciding values #####
+	
+	s_data <- data.frame(matrix(rep(NA, 6), nrow=1))[numeric(0), ]　# vacant data.frame
+	colnames(s_data) <- c("Gene_ID", 
+					  "ED",
+					  "ida",
+					  "estimate_spe",
+					  "parameters",
+					  "times_spe")
+	
+	w_data <- data.frame(matrix(rep(NA, 2), nrow=1))[numeric(0), ]　# vacant data.frame
+	colnames(w_data) <- c("parameters", "AUC_spe")
+	
+	## obtain dataset with random parameter
+	
+	cname <- colnames(all)
+	cname_except <- cname %>% setdiff(selected_parameter) %>% setdiff(test_parameter)
+	
+	for (n in 1:10) {
+		
+		rm(.Random.seed)
+		shuffled <- sample(cname_except, 1)
+		
+		## make new dataset
+		
+		pre_positive_spe <- positive %>% dplyr::select(Gene_ID, all_of(selected_parameter), all_of(shuffled), ED, Bind_type)
+		pre_negative_spe <- negative %>% dplyr::select(Gene_ID, all_of(selected_parameter), all_of(shuffled), ED, Bind_type)
+		
+		all_data_spe <- rbind(pre_positive_spe, pre_negative_spe) %>% dplyr::select(-Gene_ID, -ED)
+		
+		obj_spe <- tune(svm, factor(Bind_type) ~., data = all_data_spe,
+					ranges = list(gamma = 10^(seq(-5, 5, 0.1)), cost = 10^(seq(-2, 2, 0.1))),
+					tunecontrol = tune.control(sampling = "cross", cross = 10))
+		
+		times_spe <- n
+		
+		## data making
+		
+		positive_spe <- pre_positive_spe[sample(n_data, n_data),]
+		negative_spe <- pre_negative_spe[sample(n_data, n_data),]
+		
+		for (j in 1:n_data) {
+			
+			train_p_spe <- positive_spe[-j,]
+			valid_p_spe <- positive_spe[j,]
+			train_n_spe <- negative_spe[-j,]
+			valid_n_spe <- negative_spe[j,]
+			train_spe  <- rbind(train_p_spe, train_n_spe)
+			valid_spe  <- rbind(valid_p_spe, valid_n_spe)
+			
+			Gene_ID <- valid_spe %>% dplyr::select(Gene_ID)　## for raw data
+			ED <- valid_spe %>% dplyr::select(ED)           ## for raw data
+			
+			trainX_spe <- train_spe %>% dplyr::select(-Gene_ID, -ED) ## for training data
+			validX_spe <- valid_spe %>% dplyr::select(-Gene_ID, -ED) ## for validation data
+			
+			model_spe <- svm(formula = factor(Bind_type) ~., data=trainX_spe, kernel = "linear",
+					gamma = obj_spe$best.parameters$gamma, 
+					cost  = obj_spe$best.parameters$cost, 
+					probability = TRUE)
+			
+			estimate_spe <- data.frame(predict(model_spe, validX_spe))　## for raw data、estimated value
+			names(estimate_spe) <- "estimate_spe" ## for raw data、estimated value
+			ida_spe <- validX_spe$Bind_type　## for raw data、original value
+			pred_spe <- predict(model_spe, validX_spe, probability = TRUE)
+			
+			SSS <- data.frame("Gene_ID"  = Gene_ID,
+					  "ED"       = ED, 
+					  "ida"      = ida_spe, 
+					  "estimate_spe" = estimate_spe,
+					  "parameters" = shuffled,
+					  "times_spe" = times_spe)
+			
+			s_data <- s_data %>% rbind(SSS)
+			
+			if (j == 1) {
+				predictions_spe <- attr(pred_spe, "probabilities") %>%
+								cbind(Gene_ID) %>% cbind(times_spe) %>% cbind(shuffled) 
+				roc_valid_spe <- validX_spe
+			
+			}else{
+				pre_predictions_spe <- attr(pred_spe, "probabilities") %>%
+										cbind(Gene_ID) %>% cbind(times_spe) %>% cbind(shuffled) 
+				predictions_spe <- rbind(predictions_spe, pre_predictions_spe)
+				pre_roc_spe <- validX_spe
+				roc_valid_spe <- rbind(roc_valid_spe, pre_roc_spe)
+			}
+		}
+		
+		if (n == 1) {
+			predictions_spe_sum <- predictions_spe
+		
+		}else{
+			predictions_spe_sum <- predictions_spe_sum %>% rbind(predictions_spe)
+		}
+	}
+	
+	for (o in 1:10) {
+		prediction_table_spe <- data.frame(predictions_spe_sum) %>% dplyr::filter(times_spe == o, shuffled == shuffled)
+		roc_valid_table_spe <- data.frame(roc_valid_spe)
+		
+		roc.curve.spe <- roc(response = roc_valid_table_spe$Bind_type, predictor=prediction_table_spe[,1], levels = c("FP","T_multi"))
+		b <- auc(roc.curve.spe) ## auc value,specific
+		
+		CCC <- data.frame("parameters" = shuffled, "AUC_spe" = b)
+		w_data <- w_data %>% rbind(CCC)
+		
+		plot(roc.curve.spe, legacy.axes = TRUE, col = "SandyBrown", cex = 2.0)
+		par(new = T)
+	}
+	
+	dev.off()
+		
+	write.csv(s_data, "row_data.csv", row.names=F)
+	write.csv(w_data, "auc_data.csv", row.names=F)
+	write.csv(predictions_spe_sum, "prediction_table_spe.csv", row.names = F)
+}
